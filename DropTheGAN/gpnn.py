@@ -22,6 +22,8 @@ from extractor import ViTExtractor
 _MAX_MEMORY_SIZE = 1 << 30
 _INF = float('inf')
 
+# Debugging function which shows the query, key, value and output images to the screen.
+# Also supports passing the query and key clustering
 def show_images(query, key, value, output, query_clustering=None, key_clustering=None):
     query_image = query.squeeze().permute(1, 2, 0)
     query_image = utils_local.to_numpy((255 * query_image).clamp(0, 255).to(dtype=torch.uint8))
@@ -81,13 +83,10 @@ def gpnn(pyramid: Sequence[torch.Tensor],
          alpha: float = _INF,
          output_pyramid_shape: Optional[Sequence[torch.Size]] = None,
          mask_pyramid: Optional[Sequence[torch.Tensor]] = None,
-         # num_iters_in_level: int = 6,
          num_iters_in_level: int = 10,
          num_iters_in_coarsest_level: int = 1,
          reduce: str = 'weighted_mean',
          should_use_our_code=True) -> torch.Tensor:
-    should_use_our_code=False
-    patch_size = 7
     if output_pyramid_shape is None:
         output_pyramid_shape = [image.shape for image in pyramid]
     if mask_pyramid is None:
@@ -95,48 +94,55 @@ def gpnn(pyramid: Sequence[torch.Tensor],
     generated = initial_guess
     coarsest_level = len(pyramid) - 1
     for level in range(coarsest_level, -1, -1):
+
+        # Handle coarsest level
         if level == coarsest_level:
             for i in range(num_iters_in_coarsest_level):
                 should_show_images = True
                 should_run_dino = should_use_our_code
-                original_weight = 30
-                dino_weight = 70
+                original_weight = 10
+                dino_weight = 90
                 generated = pnn(generated,
                                 key=pyramid[level],
                                 value=pyramid[level],
                                 mask=mask_pyramid[level],
-                                # patch_size=patch_size,
+                                # Modified patch size to be 3 for first iteration which has a high dino weight
                                 patch_size=3,
                                 alpha=alpha,
                                 reduce=reduce,
-                                should_show_images=False,
+                                should_show_images=should_show_images,
                                 should_run_dino=should_run_dino,
                                 original_weight=original_weight,
                                 dino_weight=dino_weight)
         else:
-            # At the last levels, do not iterate
+            # At the last levels, do not iterate in order to save run-time (adding iterations over here has minimal actual impact on final result, but is heavy from run-time point of view on weak machines)
             if level < 3:
                 num_iters_in_level = 1
+
+            # Generate blurred
             blurred = resize_right.resize(pyramid[level + 1],
                                           1 / downscale_ratio,
                                           pyramid[level].shape)
+            # Future-Supporting patch resizing during run for debugging.
             current_patch_size = patch_size
             if level == coarsest_level-1:
                 current_patch_size = 7
             if level == coarsest_level-2:
                 current_patch_size = 7
+
             for i in range(num_iters_in_level):
                 should_show_images = i==0
-                should_run_dino = False #should_use_our_code and level > coarsest_level-2 #i==0 and level > coarsest_level-2
-                original_weight = 30
-                dino_weight = 70
-                # if level == coarsest_level-1:
-                #     original_weight = 30
-                #     dino_weight = 70
-                # elif level == coarsest_level-2:
-                #     original_weight = 45
-                #     dino_weight = 55
+                should_run_dino = should_use_our_code and level > coarsest_level-3
+                original_weight = 50
+                dino_weight = 50
+                if level == coarsest_level-1:
+                    original_weight = 30
+                    dino_weight = 70
+                elif level == coarsest_level-2:
+                    original_weight = 40
+                    dino_weight = 60
 
+                # Call actual pnn module
                 print(f"Level: {level}. coarsest_level: {coarsest_level}. iter: {i+1}/{num_iters_in_level}")
                 generated = pnn(generated,
                                 key=blurred,
@@ -149,37 +155,21 @@ def gpnn(pyramid: Sequence[torch.Tensor],
                                 should_run_dino=should_run_dino,
                                 original_weight=original_weight,
                                 dino_weight=dino_weight)
+
+        # Resize generated output to match next level input
         if level > 0:
             generated = resize_right.resize(generated, 1 / downscale_ratio,
                                             output_pyramid_shape[level - 1])
     return generated
 
-def find_cosegmentation(image_paths: List[str], elbow: float = 0.975, load_size: int = 224, layer: int = 11,
+# Based on logic taken from dino-vit-features
+def find_clustering(image_paths: List[str], elbow: float = 0.975, load_size: int = 224, layer: int = 11,
                         facet: str = 'key', bin: bool = False, thresh: float = 0.065, model_type: str = 'dino_vits8',
                         stride: int = 4, votes_percentage: int = 75, sample_interval: int = 100,
                         remove_outliers: bool = False, outliers_thresh: float = 0.7, low_res_saliency_maps: bool = True,
                         save_dir: str = None):
-    """
-    finding cosegmentation of a set of images.
-    :param image_paths: a list of paths of all the images.
-    :param elbow: elbow coefficient to set number of clusters.
-    :param load_size: size of the smaller edge of loaded images. If None, does not resize.
-    :param layer: layer to extract descriptors from.
-    :param facet: facet to extract descriptors from.
-    :param bin: if True use a log-binning descriptor.
-    :param thresh: threshold of saliency maps to distinguish fg and bg.
-    :param model_type: type of model to extract descriptors from.
-    :param stride: stride of the model.
-    :param votes_percentage: the percentage of positive votes so a cluster will be considered salient.
-    :param sample_interval: sample every ith descriptor before applying clustering.
-    :param remove_outliers: assume existence of outlier images and remove them from cosegmentation process.
-    :param outliers_thresh: threshold on cosine similarity between cls descriptors to determine outliers.
-    :param low_res_saliency_maps: Use saliency maps with lower resolution (dramatically reduces GPU RAM needs,
-    doesn't deteriorate performance).
-    :param save_dir: optional. if not None save intermediate results in this directory.
-    :return: a list of segmentation masks and a list of processed pil images.
-    """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Use the VitExtractor defined in dino-vit-features
     extractor = ViTExtractor(model_type, stride, device=device)
     descriptors_list = []
     saliency_maps_list = []
@@ -193,6 +183,8 @@ def find_cosegmentation(image_paths: List[str], elbow: float = 0.975, load_size:
     if remove_outliers:
         cls_descriptors = []
     num_images = len(image_paths)
+
+    # Create save_dir if needed
     if save_dir is not None:
         save_dir = Path(save_dir)
 
@@ -226,17 +218,18 @@ def find_cosegmentation(image_paths: List[str], elbow: float = 0.975, load_size:
             saliency_map = saliency_map[0]
         saliency_maps_list.append(saliency_map)
 
+    # Remove outliers if needed
     if remove_outliers:
         all_cls_descriptors = torch.stack(cls_descriptors, dim=2)[0, 0]
         mean_cls_descriptor = torch.mean(all_cls_descriptors, dim=0)[None, ...]
         cos_sim = torch.nn.CosineSimilarity(dim=1)
         similarities_to_mean = cos_sim(all_cls_descriptors, mean_cls_descriptor)
         inliers_idx = torch.where(similarities_to_mean >= outliers_thresh)[0]
-        inlier_image_paths, outlier_image_paths = [], []
         inlier_descriptors, outlier_descriptors = [], []
-        inlier_saliency_maps, outlier_saliency_maps = [], []
+        inlier_image_paths, outlier_image_paths = [], []
         inlier_image_pil, outlier_image_pil = [], []
         inlier_num_patches, outlier_num_patches = [], []
+        inlier_saliency_maps, outlier_saliency_maps = [], []
         inlier_load_size, outlier_load_size = [], []
         for idx, (image_path, descriptor, saliency_map, pil_image, num_patches, load_size) in enumerate(zip(image_paths,
                 descriptors_list, saliency_maps_list, image_pil_list, num_patches_list, load_size_list)):
@@ -254,14 +247,19 @@ def find_cosegmentation(image_paths: List[str], elbow: float = 0.975, load_size:
         load_size_list = inlier_load_size
         num_images = len(inliers_idx)
 
-    # cluster all images using k-means:
+    # Cluster all images using k-means:
     all_descriptors = np.ascontiguousarray(np.concatenate(descriptors_list, axis=2)[0, 0])
     normalized_all_descriptors = all_descriptors.astype(np.float32)
-    faiss.normalize_L2(normalized_all_descriptors)  # in-place operation
+    # normalized_all_descriptors in place!!!
+    faiss.normalize_L2(normalized_all_descriptors)
+
     sampled_descriptors_list = [x[:, :, ::sample_interval, :] for x in descriptors_list]
+
     all_sampled_descriptors = np.ascontiguousarray(np.concatenate(sampled_descriptors_list, axis=2)[0, 0])
     normalized_all_sampled_descriptors = all_sampled_descriptors.astype(np.float32)
-    faiss.normalize_L2(normalized_all_sampled_descriptors)  # in-place operation
+
+    # normalized_all_sampled_descriptors in place!!!
+    faiss.normalize_L2(normalized_all_sampled_descriptors)
 
     sum_of_squared_dists = []
     n_cluster_range = list(range(1, 15))
@@ -279,10 +277,11 @@ def find_cosegmentation(image_paths: List[str], elbow: float = 0.975, load_size:
     labels_per_image = np.split(labels, np.cumsum(num_descriptors_per_image))
 
     output_images = []
-    # cmap = 'jet' if num_labels > 10 else 'tab10'
-    # cmap = 'tab20' if num_labels > 10 else 'tab10'
+    # Use color map of tab20 in order to have enough discrete colors
     cmap = 'tab20'
     print(f"Number of labels:{num_labels}")
+
+    # Iterate over images, and save the clustering to file.
     for image_path, num_patches, label_per_image in zip(image_paths, num_patches_list, labels_per_image):
         output_path = os.path.join(Path(image_path).parent, f"{Path(image_path).stem}_clustering.png")
         output_images.append(output_path)
@@ -292,25 +291,30 @@ def find_cosegmentation(image_paths: List[str], elbow: float = 0.975, load_size:
         fig.savefig(output_path, bbox_inches='tight', pad_inches=0)
         plt.close(fig)
 
+    # Return paths of output images, as needed by the calling function
     return output_images
 
-def dino_vit_get_cosegmentation(image1, image2, load_size=100, sample_interval=10, stride=2, elbow=0.975):
-    # Save image1 and image2
+def dino_vit_get_clustering(image1, image2, load_size=100, sample_interval=10, stride=2, elbow=0.975):
+    # Save image1 and image2 to local disk
     image_path_a = "/tmp/image1.png"
     image_path_b = "/tmp/image2.png"
-
     utils_local.imwrite(image_path_a, image1.squeeze())
     utils_local.imwrite(image_path_b, image2.squeeze())
 
-    cosegmentation_paths = find_cosegmentation([image_path_a, image_path_b], load_size=load_size,
+    # Find the clustering
+    clustering_paths = find_clustering([image_path_a, image_path_b], load_size=load_size,
                                                sample_interval=sample_interval,
                                                stride=stride, elbow=elbow)
-    image1_clustering = (utils_local.imread(cosegmentation_paths[0])[0:3])
-    image2_clustering = (utils_local.imread(cosegmentation_paths[1])[0:3])
+    # Get path of each clustering
+    image1_clustering = (utils_local.imread(clustering_paths[0])[0:3])
+    image2_clustering = (utils_local.imread(clustering_paths[1])[0:3])
+
+    # Resize clustering to original image size
     T = transforms.Resize(size=(tuple(image1.shape[2:])))
     image1_clustering = T(image1_clustering)
     image2_clustering = T(image2_clustering)
 
+    # Run garbage collector
     import gc;gc.collect()
     return image1_clustering.unsqueeze(0), image2_clustering.unsqueeze(0)
 
@@ -326,7 +330,10 @@ def pnn(query: torch.Tensor,
         should_run_dino=False,
         original_weight=50,
         dino_weight=50) -> torch.Tensor:
+    
+    # Run garbage collector, clears up non-needed memory from GPU
     import gc;gc.collect()
+
     query = query.unsqueeze(0)
     key = key.unsqueeze(0)
     value = value.unsqueeze(0)
@@ -343,6 +350,8 @@ def pnn(query: torch.Tensor,
     key_patches_column, _ = fold.view_as_column(fold.unfold2d(key, patch_size))
     value_patches_column, _ = fold.view_as_column(
         fold.unfold2d(value, patch_size))
+
+    # Handle masks, not relevant for structural analogy
     if mask is not None:
         mask = (mask > 0.5).to(query)
         mask_patches_column, _ = fold.view_as_column(
@@ -361,7 +370,8 @@ def pnn(query: torch.Tensor,
 
     if should_run_dino:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        query_clustering, key_clustering = dino_vit_get_cosegmentation(query, key)
+        # Get query clustering and key clustering from query and key via dino-vit
+        query_clustering, key_clustering = dino_vit_get_clustering(query, key)
         query_clustering_patches = fold.unfold2d(query_clustering, patch_size)
         query_clustering_patches_column, _ = fold.view_as_column(
             query_clustering_patches)
@@ -369,6 +379,7 @@ def pnn(query: torch.Tensor,
         query_clustering_patches_column = query_clustering_patches_column.to(device)
         key_clustering_patches_column = key_clustering_patches_column.to(device)
 
+    # Commented out line below and replaced it with an internal function that supports DINO
     # _, indices = find_normalized_nearest_neighbors(query_patches_column,
     #                                                key_patches_column, alpha)
     _, indices = find_weighted_nearest_neighbors(query_patches_column, key_patches_column,
@@ -378,14 +389,13 @@ def pnn(query: torch.Tensor,
                                                  dino_weight=dino_weight,
                                                  )
 
-
-
+    # Generate output from value patchs and indices
     out_patches_column = F.embedding(indices.squeeze(2),
                                      value_patches_column.squeeze(0))
     out_patches = fold.view_as_image(out_patches_column, query_patches_size)
     output = fold.fold2d(out_patches, reduce=reduce)
 
-    # if should_show_images:
+    # Show images via plt.show if needed
     if should_show_images or should_run_dino:
         show_images(query, key, value, output, query_clustering, key_clustering)
 
@@ -460,12 +470,15 @@ def _find_weighted_nearest_neighbors(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # Calculate original (MSE) distance
     original_dists = _compute_dist_matrix(queries, keys)
     original_dists = original_dists.to(device)
 
     if queries_clustering is not None and keys_clustering is not None:
         print("Using dino matrix calculation")
         dino_dists = []
+        # Below is a slow code which works serially. Left it here because it is much easier to debug.
         # for x in [x for x in queries_clustering[0]]:
         #     for y in [x for x in keys_clustering[0]]:
         #         x_y_diff = x - y
@@ -478,11 +491,11 @@ def _find_weighted_nearest_neighbors(
                                                       # queries_clustering.shape[1]).unsqueeze(0)
         # Normalize values according to patch size
         # dino_dists /= queries_clustering.shape[2]
-
         # Move dino_dists to device
-        # dino_dists = dino_dists.to(device)
-
+        # dino_dists = dino_dists.to(device)        
         # dino_dists = _compute_dist_matrix(queries_clustering, keys_clustering)
+
+        # Calculate DINO-dists (semantic distance)
         A_expanded = queries_clustering.squeeze(0).unsqueeze(1)
         B_expanded = keys_clustering.squeeze(0).unsqueeze(0)
         C = A_expanded-B_expanded
@@ -490,12 +503,15 @@ def _find_weighted_nearest_neighbors(
         dino_dists = C.norm(dim=2).unsqueeze(0)/queries_clustering.shape[2]
 
         print(f"original_weight={original_weight}, dino_weight={dino_weight}")
+
+        # Calculate weighted distance according to the provided weights for dino dists and original (mse) dists
         dists = (original_weight*original_dists + dino_weight*dino_dists)/(original_weight+dino_weight)
     else:
         dists = original_dists
 
     if weights is not None:
         dists *= weights
+    # Find the minimum distance according to axis=2 (nearest patch)
     return dists.min(dim=2, keepdim=True)
 
 
@@ -515,11 +531,14 @@ def find_weighted_nearest_neighbors(
     num_keys = keys.shape[1]
     if weights is not None:
         max_memory_usage //= 2
+
+    # Split to tiles if needed
     tile_height = _find_tile_height(num_queries, num_keys,
                                     batch_size * size_in_bytes,
                                     max_memory_usage)
     values = []
     indices = []
+    # Iterate over tiles and call _find_weighted_nearest_neighbors for each one
     for start in range(0, num_queries, tile_height):
         if queries_clustering is not None:
             value, idx = _find_weighted_nearest_neighbors(
