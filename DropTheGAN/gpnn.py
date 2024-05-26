@@ -123,24 +123,25 @@ def gpnn(pyramid: Sequence[torch.Tensor],
             blurred = resize_right.resize(pyramid[level + 1],
                                           1 / downscale_ratio,
                                           pyramid[level].shape)
-            # Future-Supporting patch resizing during run for debugging.
-            current_patch_size = patch_size
-            if level == coarsest_level-1:
-                current_patch_size = 7
-            if level == coarsest_level-2:
-                current_patch_size = 7
 
             for i in range(num_iters_in_level):
+                current_patch_size = patch_size
                 should_show_images = i==0
-                should_run_dino = should_use_our_code and level > coarsest_level-3
-                original_weight = 50
-                dino_weight = 50
+                should_run_dino = should_use_our_code and i%2 == 0 and level > coarsest_level-3
+
+                if should_use_our_code:
+                    if i%2 == 1 and level == coarsest_level-1:
+                        current_patch_size = 5
+
+                original_weight = 70
+                dino_weight = 30
+
                 if level == coarsest_level-1:
                     original_weight = 30
                     dino_weight = 70
                 elif level == coarsest_level-2:
-                    original_weight = 40
-                    dino_weight = 60
+                    original_weight = 60
+                    dino_weight = 40
 
                 # Call actual pnn module
                 print(f"Level: {level}. coarsest_level: {coarsest_level}. iter: {i+1}/{num_iters_in_level}")
@@ -330,7 +331,7 @@ def pnn(query: torch.Tensor,
         should_run_dino=False,
         original_weight=50,
         dino_weight=50) -> torch.Tensor:
-    
+
     # Run garbage collector, clears up non-needed memory from GPU
     import gc;gc.collect()
 
@@ -492,7 +493,7 @@ def _find_weighted_nearest_neighbors(
         # Normalize values according to patch size
         # dino_dists /= queries_clustering.shape[2]
         # Move dino_dists to device
-        # dino_dists = dino_dists.to(device)        
+        # dino_dists = dino_dists.to(device)
         # dino_dists = _compute_dist_matrix(queries_clustering, keys_clustering)
 
         # Calculate DINO-dists (semantic distance)
